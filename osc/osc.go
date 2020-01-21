@@ -73,25 +73,231 @@ type Bundle struct {
 // Verify that Bundle implements the Packet interface.
 var _ Packet = (*Bundle)(nil)
 
+// Transport is an interface about sending and receiving OSC packets over a
+// network.
+type Transport interface {
+	SetLocalAddr(ip string, port int) error
+	// IsConnected returns whether the transport is connected or not.
+	IsConnected() bool
+	// Connect creates a UDP connection or TCP listener.
+	Connect(address string) error
+	// Disconnect closes the UDP connection or TCP listener.
+	Disconnect()
+	// Send serializes a Packet into bytes and sends it to the specified address
+	// and port.
+	Send(packet Packet) error
+	// Receive receives bytes and parses them into a Packet.
+	Receive(readTimeout time.Duration) (Packet, error)
+}
+
+// UDPTransport implements Transport by sending and receiving OSC packets over a
+// network via UDP.
+type UDPTransport struct {
+	laddr      *net.UDPAddr
+	connection net.PacketConn
+}
+
+// TCPTransport implements Transport by sending and receiving OSC packets over a
+// network via TCP.
+type TCPTransport struct {
+	laddr    *net.TCPAddr
+	listener net.Listener
+}
+
+// SetLocalAddr implements Transport.SetLocalAddr for UDP.
+func (ut UDPTransport) SetLocalAddr(ip string, port int) error {
+	laddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", ip, port))
+	if err != nil {
+		return err
+	}
+	ut.laddr = laddr
+
+	return nil
+}
+
+// SetLocalAddr implements Transport.SetLocalAddr for TCP.
+func (tt TCPTransport) SetLocalAddr(ip string, port int) error {
+	laddr, err := net.ResolveTCPAddr("tcp", fmt.Sprintf("%s:%d", ip, port))
+	if err != nil {
+		return err
+	}
+	tt.laddr = laddr
+
+	return nil
+}
+
+// IsConnected implements Transport.IsConnected for UDP.
+func (ut UDPTransport) IsConnected() bool {
+	return ut.connection != nil
+}
+
+// IsConnected implements Transport.IsConnected for TCP.
+func (tt TCPTransport) IsConnected() bool {
+	return tt.listener != nil
+}
+
+// Connect implements Transport.Connect for UDP.
+func (ut UDPTransport) Connect(address string) error {
+	conn, err := net.ListenPacket("udp", address)
+	if err != nil {
+		return err
+	}
+
+	ut.connection = conn
+
+	return nil
+}
+
+// Connect implements Transport.Connect for TCP.
+func (tt TCPTransport) Connect(address string) error {
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		return err
+	}
+
+	tt.listener = listener
+
+	return nil
+}
+
+// Disconnect implements Transport.Disconnect for UDP.
+func (ut UDPTransport) Disconnect() {
+	if ut.connection != nil {
+		ut.connection.Close()
+		ut.connection = nil
+	}
+}
+
+// Disconnect implements Transport.Disconnect for TCP.
+func (tt TCPTransport) Disconnect() {
+	if tt.listener != nil {
+		tt.listener.Close()
+		tt.listener = nil
+	}
+}
+
+// Send implements Transport.Send for UDP.
+func (ut UDPTransport) Send(address string, port int, packet Packet) error {
+	data, err := packet.MarshalBinary()
+	if err != nil {
+		return err
+	}
+
+	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", address, port))
+	if err != nil {
+		return err
+	}
+	conn, err := net.DialUDP("udp", ut.laddr, addr)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	if _, err = conn.Write(data); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// Send implements Transport.Send for TCP.
+func (tt TCPTransport) Send(address string, port int, packet Packet) error {
+	data, err := packet.MarshalBinary()
+	if err != nil {
+		return err
+	}
+
+	addr, err := net.ResolveTCPAddr("tcp", fmt.Sprintf("%s:%d", address, port))
+	if err != nil {
+		return err
+	}
+	conn, err := net.DialTCP("tcp", tt.laddr, addr)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	if _, err = conn.Write(data); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// Receive implements Transport.Receive for UDP.
+func (ut UDPTransport) Receive(readTimeout time.Duration) (Packet, error) {
+	if !ut.IsConnected() {
+		return nil, fmt.Errorf("unable to receive: must connect first")
+	}
+
+	if readTimeout != 0 {
+		err := ut.connection.SetReadDeadline(time.Now().Add(readTimeout))
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	data := make([]byte, 65535)
+	n, _, err := ut.connection.ReadFrom(data)
+	if err != nil {
+		return nil, err
+	}
+
+	var start int
+	p, err := readPacket(bufio.NewReader(bytes.NewBuffer(data)), &start, n)
+	if err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+// Receive implements Transport.Receive for TCP.
+func (tt TCPTransport) Receive(readTimeout time.Duration) (Packet, error) {
+	if !tt.IsConnected() {
+		return nil, fmt.Errorf("unable to receive: must connect first")
+	}
+
+	conn, err := tt.listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	if readTimeout != 0 {
+		if err := conn.SetReadDeadline(time.Now().Add(readTimeout)); err != nil {
+			return nil, err
+		}
+	}
+
+	data, err := ioutil.ReadAll(conn)
+	if err != nil {
+		return nil, err
+	}
+
+	var start int
+	end := len(data)
+	p, err := readPacket(bufio.NewReader(bytes.NewBuffer(data)), &start, end)
+	if err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
 // Client enables you to send OSC packets. It sends OSC messages and bundles to
 // the given IP address and port.
 type Client struct {
-	ip              string
-	port            int
-	laddr           *net.UDPAddr
-	laddrTCP        *net.TCPAddr
-	networkProtocol NetworkProtocol
+	ip        string
+	port      int
+	transport Transport
 }
 
 // Server represents an OSC server. The server listens on Address and Port for
 // incoming OSC packets and bundles.
 type Server struct {
-	Addr            string
-	Dispatcher      Dispatcher
-	ReadTimeout     time.Duration
-	networkProtocol NetworkProtocol
-	udpConnection   net.PacketConn
-	tcpListener     net.Listener
+	Addr        string
+	Dispatcher  Dispatcher
+	ReadTimeout time.Duration
+	transport   Transport
 }
 
 // Timetag represents an OSC Time Tag.
@@ -498,16 +704,42 @@ func (b *Bundle) MarshalBinary() ([]byte, error) {
 // Client
 ////
 
-// NewClient creates a new OSC client. The Client is used to send OSC
+// NewClientUDP creates a new OSC client. The Client is used to send OSC
 // messages and OSC bundles over a network connection.
 //
-// The default network protocol is UDP. To use TCP instead, use
-// client.SetNetworkProtocol(TCP).
+// The network protocol is UDP. To use TCP instead, use NewClientTCP.
 //
 // The `ip` argument specifies the IP address and `port` defines the target port
 // where the messages and bundles will be send to.
+func NewClientUDP(ip string, port int) *Client {
+	return &Client{ip: ip, port: port, transport: UDPTransport{}}
+}
+
+// NewClientTCP creates a new OSC client. The Client is used to send OSC
+// messages and OSC bundles over a network connection.
+//
+// The network protocol is TCP. To use UDP instead, use NewClientUDP.
+//
+// The `ip` argument specifies the IP address and `port` defines the target port
+// where the messages and bundles will be send to.
+func NewClientTCP(ip string, port int) *Client {
+	return &Client{ip: ip, port: port, transport: UDPTransport{}}
+}
+
+// NewClient creates a new OSC client. The Client is used to send OSC
+// messages and OSC bundles over a network connection.
+//
+// The `ip` argument specifies the IP address and `port` defines the target port
+// where the messages and bundles will be send to.
+//
+// The network protocol is UDP. To use TCP instead, use NewClientTCP.
+//
+// Deprecated: This method exists for backwards compatibility. Originally,
+// go-osc only supported UDP, and the constructor was called NewClient. Now,
+// there are two constructors that explicitly specify the protocol to use:
+// NewClientUDP and NewClientTCP.
 func NewClient(ip string, port int) *Client {
-	return &Client{ip: ip, port: port, laddr: nil, networkProtocol: UDP}
+	return NewClientUDP(ip, port)
 }
 
 // IP returns the IP address.
@@ -524,103 +756,110 @@ func (c *Client) SetPort(port int) { c.port = port }
 
 // SetLocalAddr sets the local address.
 func (c *Client) SetLocalAddr(ip string, port int) error {
-	switch c.networkProtocol {
-	case UDP:
-		laddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", ip, port))
-		if err != nil {
-			return err
-		}
-		c.laddr = laddr
-	case TCP:
-		laddrTCP, err := net.ResolveTCPAddr("tcp", fmt.Sprintf("%s:%d", ip, port))
-		if err != nil {
-			return err
-		}
-		c.laddrTCP = laddrTCP
-	}
-
-	return nil
+	return c.transport.SetLocalAddr(ip, port)
 }
 
 // NetworkProtocol returns the network protocol.
 func (c *Client) NetworkProtocol() NetworkProtocol {
-	return c.networkProtocol
-}
-
-// SetNetworkProtocol sets the network protocol.
-func (c *Client) SetNetworkProtocol(protocol NetworkProtocol) {
-	c.networkProtocol = protocol
+	switch c.transport.(type) {
+	case UDPTransport:
+		return UDP
+	case TCPTransport:
+		return TCP
+	// This should never happen.
+	default:
+		return UDP
+	}
 }
 
 // Send sends an OSC Bundle or an OSC Message.
 func (c *Client) Send(packet Packet) error {
-	data, err := packet.MarshalBinary()
-	if err != nil {
-		return err
+	if !c.transport.IsConnected() {
+		c.transport.Connect(c.connectAddress)
 	}
 
-	switch c.networkProtocol {
-	case UDP:
-		addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", c.ip, c.port))
-		if err != nil {
-			return err
-		}
-		conn, err := net.DialUDP("udp", c.laddr, addr)
-		if err != nil {
-			return err
-		}
-		defer conn.Close()
-
-		if _, err = conn.Write(data); err != nil {
-			return err
-		}
-	case TCP:
-		addr, err := net.ResolveTCPAddr("tcp", fmt.Sprintf("%s:%d", c.ip, c.port))
-		if err != nil {
-			return err
-		}
-		conn, err := net.DialTCP("tcp", c.laddrTCP, addr)
-		if err != nil {
-			return err
-		}
-		defer conn.Close()
-
-		if _, err = conn.Write(data); err != nil {
-			return err
-		}
-	}
-
-	return nil
+	return c.transport.Send(packet)
 }
 
 ////
 // Server
 ////
 
-// NewServer creates a new OSC server. The server receives OSC messages and
+// NewServerUDP creates a new OSC server. The server receives OSC messages and
 // bundles over a network connection.
 //
-// The default network protocol is UDP. To use TCP instead, use
-// server.SetNetworkProtocol(TCP).
-func NewServer(
+// The network protocol is UDP. To use TCP instead, use NewServerTCP.
+func NewServerUDP(
 	addr string, dispatcher Dispatcher, readTimeout time.Duration,
 ) *Server {
 	return &Server{
-		Addr:            addr,
-		Dispatcher:      dispatcher,
-		ReadTimeout:     readTimeout,
-		networkProtocol: UDP,
+		Addr:        addr,
+		Dispatcher:  dispatcher,
+		ReadTimeout: readTimeout,
+		transport:   UDPTransport{},
 	}
+}
+
+// NewServerTCP creates a new OSC server. The server receives OSC messages and
+// bundles over a network connection.
+//
+// The network protocol is TCP. To use UDP instead, use NewServerUDP.
+func NewServerTCP(
+	addr string, dispatcher Dispatcher, readTimeout time.Duration,
+) *Server {
+	return &Server{
+		Addr:        addr,
+		Dispatcher:  dispatcher,
+		ReadTimeout: readTimeout,
+		transport:   TCPTransport{},
+	}
+}
+
+// NewServer creates a new OSC server. The server receives OSC messages and
+// bundles over a network connection.
+//
+// The network protocol is UDP. To use TCP instead, use NewServerTCP.
+//
+// Deprecated: This method exists for backwards compatibility. Originally,
+// go-osc only supported UDP, and the constructor was called NewServer. Now,
+// there are two constructors that explicitly specify the protocol to use:
+// NewServerUDP and NewServerTCP.
+func NewServer(
+	addr string, dispatcher Dispatcher, readTimeout time.Duration,
+) *Server {
+	return NewServerUDP(addr, dispatcher, readTimeout)
 }
 
 // NetworkProtocol returns the network protocol.
 func (s *Server) NetworkProtocol() NetworkProtocol {
-	return s.networkProtocol
+	switch s.transport.(type) {
+	case UDPTransport:
+		return UDP
+	case TCPTransport:
+		return TCP
+	// This should never happen.
+	default:
+		return UDP
+	}
 }
 
 // SetNetworkProtocol sets the network protocol.
 func (s *Server) SetNetworkProtocol(protocol NetworkProtocol) {
-	s.networkProtocol = protocol
+	switch protocol {
+	case UDP:
+		s.transport = UDPTransport{}
+	case TCP:
+		s.transport = TCPTransport{}
+	}
+}
+
+// Receive receives bytes and parses them into a Packet.
+func (s *Server) Receive() (Packet, error) {
+	if !s.transport.IsConnected() {
+		s.transport.Connect(s.Addr)
+	}
+
+	return s.transport.Receive(s.ReadTimeout)
 }
 
 // ListenAndServe opens a connection, retrieves incoming OSC packets and
@@ -628,36 +867,15 @@ func (s *Server) SetNetworkProtocol(protocol NetworkProtocol) {
 //
 // The connection is closed in the event of an error or interruption.
 func (s *Server) ListenAndServe() error {
-	defer s.CloseConnection()
+	defer s.Disconnect()
 
 	if s.Dispatcher == nil {
 		s.Dispatcher = NewStandardDispatcher()
 	}
 
-	switch s.networkProtocol {
-	case UDP:
-		ln, err := net.ListenPacket("udp", s.Addr)
-		if err != nil {
-			return err
-		}
-
-		return s.Serve(ln)
-	case TCP:
-		l, err := net.Listen("tcp", s.Addr)
-		if err != nil {
-			return err
-		}
-
-		return s.ServeTCP(l)
-	default:
-		return fmt.Errorf("unsupported network protocol: %v", s.networkProtocol)
-	}
-}
-
-func (s *Server) serve(readPacket func() (Packet, error)) error {
 	var tempDelay time.Duration
 	for {
-		msg, err := readPacket()
+		msg, err := s.Receive()
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Temporary() {
 				if tempDelay == 0 {
@@ -678,91 +896,17 @@ func (s *Server) serve(readPacket func() (Packet, error)) error {
 	}
 }
 
-// Serve retrieves incoming OSC packets from the given connection and dispatches
-// retrieved OSC packets. If something goes wrong an error is returned.
-func (s *Server) Serve(c net.PacketConn) error {
-	s.udpConnection = c
-	return s.serve(func() (Packet, error) { return s.readFromConnection(c) })
-}
-
-// ServeTCP retrieves incoming OSC packets from the given connection and
-// dispatches retrieved OSC packets. If something goes wrong an error is
-// returned.
-func (s *Server) ServeTCP(l net.Listener) error {
-	s.tcpListener = l
-	return s.serve(func() (Packet, error) { return s.ReceiveTCPPacket(l) })
-}
-
-// CloseConnection forcibly closes a server's connection.
+// Disconnect forcibly closes a server's UDP connection or TCP listener.
 //
 // This causes a "use of closed network connection" error the next time the
 // server attempts to read from the connection.
-func (s *Server) CloseConnection() {
-	switch s.networkProtocol {
-	case UDP:
-		if s.udpConnection != nil {
-			s.udpConnection.Close()
-		}
-	case TCP:
-		if s.tcpListener != nil {
-			s.tcpListener.Close()
-		}
-	}
+func (s *Server) Disconnect() {
+	s.transport.Disconnect()
 }
 
 // ReceivePacket listens for incoming OSC packets and returns the packet if one is received.
-func (s *Server) ReceivePacket(c net.PacketConn) (Packet, error) {
-	return s.readFromConnection(c)
-}
-
-// readFromConnection retrieves OSC packets.
-func (s *Server) readFromConnection(c net.PacketConn) (Packet, error) {
-	if s.ReadTimeout != 0 {
-		if err := c.SetReadDeadline(time.Now().Add(s.ReadTimeout)); err != nil {
-			return nil, err
-		}
-	}
-
-	data := make([]byte, 65535)
-	n, _, err := c.ReadFrom(data)
-	if err != nil {
-		return nil, err
-	}
-
-	var start int
-	p, err := readPacket(bufio.NewReader(bytes.NewBuffer(data)), &start, n)
-	if err != nil {
-		return nil, err
-	}
-	return p, nil
-}
-
-// ReceiveTCPPacket listens for incoming OSC packets and returns the packet if
-// one is received.
-func (s *Server) ReceiveTCPPacket(l net.Listener) (Packet, error) {
-	conn, err := l.Accept()
-	if err != nil {
-		return nil, err
-	}
-
-	if s.ReadTimeout != 0 {
-		if err := conn.SetReadDeadline(time.Now().Add(s.ReadTimeout)); err != nil {
-			return nil, err
-		}
-	}
-
-	data, err := ioutil.ReadAll(conn)
-	if err != nil {
-		return nil, err
-	}
-
-	var start int
-	end := len(data)
-	p, err := readPacket(bufio.NewReader(bytes.NewBuffer(data)), &start, end)
-	if err != nil {
-		return nil, err
-	}
-	return p, nil
+func (s *Server) ReceivePacket() (Packet, error) {
+	return s.transport.Receive(s.ReadTimeout)
 }
 
 // ParsePacket parses the given msg string and returns a Packet

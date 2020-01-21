@@ -144,13 +144,13 @@ func testServerMessageDispatching(
 
 	server := &Server{Addr: addr, Dispatcher: NewStandardDispatcher()}
 	server.SetNetworkProtocol(protocol)
-	defer server.CloseConnection()
+	defer server.Disconnect()
 
 	if err := server.Dispatcher.(*StandardDispatcher).AddMsgHandler(
 		"/address/test",
 		func(msg *Message) {
 			defer func() {
-				server.CloseConnection()
+				server.Disconnect()
 				finish <- true
 			}()
 
@@ -241,6 +241,7 @@ func testServerMessageReceiving(
 	t *testing.T, protocol NetworkProtocol, stringArgument string,
 ) {
 	port := 6677
+	address := "localhost:" + strconv.Itoa(port)
 
 	finish := make(chan bool)
 	start := make(chan bool)
@@ -249,37 +250,18 @@ func testServerMessageReceiving(
 
 	// Start the server in a go-routine
 	go func() {
-		server := &Server{}
-		server.SetNetworkProtocol(protocol)
-
-		var receivePacket func() (Packet, error)
+		var server *Server
 		switch protocol {
 		case UDP:
-			receivePacket = func() (Packet, error) {
-				c, err := net.ListenPacket("udp", "localhost:"+strconv.Itoa(port))
-				if err != nil {
-					return nil, err
-				}
-				defer c.Close()
-
-				return server.ReceivePacket(c)
-			}
+			server = NewServerUDP(address, nil, 0)
 		case TCP:
-			receivePacket = func() (Packet, error) {
-				l, err := net.Listen("tcp", ":"+strconv.Itoa(port))
-				if err != nil {
-					return nil, err
-				}
-				defer l.Close()
-
-				return server.ReceiveTCPPacket(l)
-			}
+			server = NewServerTCP(address, nil, 0)
 		}
 
 		// Start the client
 		start <- true
 
-		packet, err := receivePacket()
+		packet, err := server.ReceivePacket()
 		if err != nil {
 			t.Errorf("Server error: %s", err.Error())
 			return
@@ -417,7 +399,7 @@ func TestReadTimeout(t *testing.T) {
 		defer c.Close()
 
 		start <- true
-		p, err := server.ReceivePacket(c)
+		p, err := server.Receive()
 		if err != nil {
 			t.Errorf("server error: %v", err)
 			return
@@ -428,13 +410,13 @@ func TestReadTimeout(t *testing.T) {
 		}
 
 		// Second receive should time out since client is delayed 150 milliseconds
-		if _, err = server.ReceivePacket(c); err == nil {
+		if _, err = server.Receive(); err == nil {
 			t.Errorf("expected error")
 			return
 		}
 
 		// Next receive should get it
-		p, err = server.ReceivePacket(c)
+		p, err = server.Receive()
 		if err != nil {
 			t.Errorf("server error: %v", err)
 			return
@@ -541,15 +523,16 @@ func TestTypeTagsString(t *testing.T) {
 	}
 }
 
-func TestClientSetLocalAddr(t *testing.T) {
-	client := NewClient("localhost", 8967)
-	err := client.SetLocalAddr("localhost", 41789)
+func TestSetLocalAddr(t *testing.T) {
+	transport := UDPTransport{}
+	err := transport.SetLocalAddr("localhost", 41789)
 	if err != nil {
 		t.Error(err.Error())
 	}
 	expectedAddr := "127.0.0.1:41789"
-	if client.laddr.String() != expectedAddr {
-		t.Errorf("Expected laddr to be %s but was %s", expectedAddr, client.laddr.String())
+	actualAddr := transport.laddr.String()
+	if actualAddr != expectedAddr {
+		t.Errorf("Expected laddr to be %s but was %s", expectedAddr, actualAddr)
 	}
 }
 
